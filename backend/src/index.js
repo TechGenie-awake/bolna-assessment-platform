@@ -151,6 +151,47 @@ async function retryAsync(fn, retries = 3, delayMs = 1000) {
 
 // ============ BOLNA INTEGRATION ============
 
+// Update the Bolna agent's system prompt to contain the assessment questions
+// before placing the call. This is the reliable way to inject dynamic questions —
+// the call API itself does not support prompt overrides.
+async function updateBolnaAgentPrompt(questions, category, candidateName) {
+  const questionList = questions
+    .map((q, i) => `Question ${i + 1}: ${q.question}`)
+    .join('\n');
+
+  const systemPrompt = `You are an expert AI interviewer conducting a ${category} assessment for ${candidateName}.
+
+Ask the following questions in order, one at a time. Wait for the candidate to fully answer each question before moving to the next. Be professional, encouraging, and concise.
+
+QUESTIONS TO ASK:
+${questionList}
+
+After all questions are answered, thank ${candidateName} and let them know their results will be available shortly. Then end the call.`;
+
+  // Bolna agent update — uses task_1 key as per Bolna's agent schema
+  const res = await fetch(`https://api.bolna.dev/agent/${process.env.BOLNA_AGENT_ID}`, {
+    method: 'PUT',
+    headers: {
+      'Authorization': `Bearer ${process.env.BOLNA_API_KEY}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      agent_prompts: {
+        task_1: { system_prompt: systemPrompt },
+      },
+    }),
+  });
+
+  const data = await res.json();
+  if (!res.ok) {
+    // Non-fatal: log the warning but don't block the call. The static agent
+    // prompt will be used as a fallback.
+    console.warn('Bolna agent update failed (non-fatal):', JSON.stringify(data));
+  } else {
+    console.log('Bolna agent prompt updated for:', category);
+  }
+}
+
 async function startBolnaCall(sessionId) {
   const session = await service.getSession(sessionId);
 
@@ -159,27 +200,13 @@ async function startBolnaCall(sessionId) {
   }
 
   const questions = session.question_bank || [];
-  const questionList = questions
-    .map((q, i) => `Question ${i + 1}: ${q.question}`)
-    .join('\n');
 
-  // Dynamic agent prompt includes the actual assessment questions so the AI
-  // conducts a structured interview specific to this assessment type.
-  // Note: The exact field names for agent_prompts may vary by Bolna plan/version;
-  // adjust agent_prompts keys if needed based on your Bolna dashboard config.
+  // Update agent prompt with this assessment's questions before placing the call
+  await updateBolnaAgentPrompt(questions, session.category, session.name);
+
   const bolnaPayload = {
     agent_id: process.env.BOLNA_AGENT_ID,
     recipient_phone_number: session.phone,
-    agent_prompts: {
-      task_description: `You are an expert AI interviewer conducting a ${session.category} technical assessment for ${session.name}.
-
-Your job is to ask the following questions in order, one at a time. After asking each question, wait for the candidate to finish their response before moving on. Be professional, encouraging, and concise.
-
-QUESTIONS TO ASK:
-${questionList}
-
-After all questions are answered, thank the candidate by name and let them know the assessment is complete and their results will be available shortly. Then end the call.`,
-    },
     // Metadata is echoed back in Bolna webhook events — used for session lookup
     metadata: {
       session_id: String(sessionId),
@@ -229,9 +256,11 @@ async function scoreWithGroq(sessionId) {
   const session = await service.getSession(sessionId);
 
   if (responses.length === 0) {
-    console.warn(`No responses found for session ${sessionId} — skipping scoring.`);
+    console.warn(`No responses found for session ${sessionId} — scoring skipped.`);
     return null;
   }
+
+  console.log(`Scoring ${responses.length} response(s) for session ${sessionId}`);
 
   const scoringPrompt = `You are an expert interviewer evaluating a candidate's assessment responses.
 
@@ -314,7 +343,19 @@ async function parseTranscriptWithGroq(sessionId, transcript) {
   const questions = session.question_bank || [];
 
   if (!transcript || transcript.trim().length === 0) {
-    console.warn(`Empty transcript for session ${sessionId} — skipping parse.`);
+    // No transcript (e.g. manual completion without webhook) — seed placeholder
+    // responses from the question bank so scoring can still proceed.
+    console.warn(`Empty transcript for session ${sessionId} — seeding placeholder responses from question bank.`);
+    await pool.query('DELETE FROM responses WHERE session_id = $1', [sessionId]);
+    for (const q of questions) {
+      await service.saveResponse(
+        sessionId,
+        q.id || q.question.substring(0, 20),
+        q.question,
+        'No response recorded — call transcript was not available.',
+        0
+      );
+    }
     return;
   }
 
