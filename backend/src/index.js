@@ -151,47 +151,6 @@ async function retryAsync(fn, retries = 3, delayMs = 1000) {
 
 // ============ BOLNA INTEGRATION ============
 
-// Update the Bolna agent's system prompt to contain the assessment questions
-// before placing the call. This is the reliable way to inject dynamic questions —
-// the call API itself does not support prompt overrides.
-async function updateBolnaAgentPrompt(questions, category, candidateName) {
-  const questionList = questions
-    .map((q, i) => `Question ${i + 1}: ${q.question}`)
-    .join('\n');
-
-  const systemPrompt = `You are an expert AI interviewer conducting a ${category} assessment for ${candidateName}.
-
-Ask the following questions in order, one at a time. Wait for the candidate to fully answer each question before moving to the next. Be professional, encouraging, and concise.
-
-QUESTIONS TO ASK:
-${questionList}
-
-After all questions are answered, thank ${candidateName} and let them know their results will be available shortly. Then end the call.`;
-
-  // Bolna agent update — uses task_1 key as per Bolna's agent schema
-  const res = await fetch(`https://api.bolna.dev/agent/${process.env.BOLNA_AGENT_ID}`, {
-    method: 'PUT',
-    headers: {
-      'Authorization': `Bearer ${process.env.BOLNA_API_KEY}`,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({
-      agent_prompts: {
-        task_1: { system_prompt: systemPrompt },
-      },
-    }),
-  });
-
-  const data = await res.json();
-  if (!res.ok) {
-    // Non-fatal: log the warning but don't block the call. The static agent
-    // prompt will be used as a fallback.
-    console.warn('Bolna agent update failed (non-fatal):', JSON.stringify(data));
-  } else {
-    console.log('Bolna agent prompt updated for:', category);
-  }
-}
-
 async function startBolnaCall(sessionId) {
   const session = await service.getSession(sessionId);
 
@@ -200,18 +159,29 @@ async function startBolnaCall(sessionId) {
   }
 
   const questions = session.question_bank || [];
+  const questionCount = String(questions.length);
+  const questionsList = questions
+    .map((q, i) => `Question ${i + 1}: ${q.question}`)
+    .join('\n\n');
 
-  // Update agent prompt with this assessment's questions before placing the call
-  await updateBolnaAgentPrompt(questions, session.category, session.name);
-
+  // Bolna's call API populates {{variable}} placeholders in the agent prompt
+  // via the top-level "variables" field. The agent on the Bolna platform must
+  // already have these variable names in its system prompt template.
+  // agent_data only accepts voice_id — do NOT put variables there.
   const bolnaPayload = {
     agent_id: process.env.BOLNA_AGENT_ID,
     recipient_phone_number: session.phone,
-    // Metadata is echoed back in Bolna webhook events — used for session lookup
+    variables: {
+      candidate_name: session.name,
+      assessment_category: session.category,
+      assessment_type: session.category,
+      questions_list: questionsList,
+      question_count: questionCount,
+      assessment_title: session.assessment_title || session.category,
+    },
+    // metadata is echoed back in webhook events — used for reliable session lookup
     metadata: {
       session_id: String(sessionId),
-      assessment_category: session.category,
-      candidate_name: session.name,
     },
   };
 
