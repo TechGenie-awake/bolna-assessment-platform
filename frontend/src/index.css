@@ -1,0 +1,15 @@
+@import "tailwindcss";
+@layer base {
+  body {
+    @apply font-sans antialiased;
+  }
+}
+ 
+@layer components {
+  .line-clamp-2 {
+    display: -webkit-box;
+    -webkit-line-clamp: 2;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
+  }
+}
