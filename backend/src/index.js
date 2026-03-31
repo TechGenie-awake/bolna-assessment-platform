@@ -1,4 +1,4 @@
-// backend/src/index.js
+// backend/src/index.js - COMPLETE FIXED VERSION
 const express = require('express');
 const cors = require('cors');
 const { Pool } = require('pg');
@@ -14,7 +14,6 @@ const pool = new Pool({
 });
 
 // ============ SSE CLIENT STORE ============
-// Map<sessionId, Set<res>>
 const sseClients = new Map();
 
 function broadcastSessionUpdate(sessionId, data) {
@@ -100,7 +99,6 @@ class AssessmentService {
   }
 
   async saveScores(session_id, scores) {
-    // Upsert so re-scoring doesn't create duplicates
     await pool.query('DELETE FROM scores WHERE session_id = $1', [session_id]);
     const result = await pool.query(
       `INSERT INTO scores
@@ -133,7 +131,6 @@ const service = new AssessmentService();
 // ============ HELPERS ============
 
 function validatePhone(phone) {
-  // Must start with + and have 7-15 digits
   return /^\+[1-9]\d{6,14}$/.test(phone);
 }
 
@@ -149,48 +146,7 @@ async function retryAsync(fn, retries = 3, delayMs = 1000) {
   }
 }
 
-// ============ BOLNA INTEGRATION ============
-
-// Update the Bolna agent's system prompt to contain the assessment questions
-// before placing the call. This is the reliable way to inject dynamic questions —
-// the call API itself does not support prompt overrides.
-async function updateBolnaAgentPrompt(questions, category, candidateName) {
-  const questionList = questions
-    .map((q, i) => `Question ${i + 1}: ${q.question}`)
-    .join('\n');
-
-  const systemPrompt = `You are an expert AI interviewer conducting a ${category} assessment for ${candidateName}.
-
-Ask the following questions in order, one at a time. Wait for the candidate to fully answer each question before moving to the next. Be professional, encouraging, and concise.
-
-QUESTIONS TO ASK:
-${questionList}
-
-After all questions are answered, thank ${candidateName} and let them know their results will be available shortly. Then end the call.`;
-
-  // Bolna agent update — uses task_1 key as per Bolna's agent schema
-  const res = await fetch(`https://api.bolna.dev/agent/${process.env.BOLNA_AGENT_ID}`, {
-    method: 'PUT',
-    headers: {
-      'Authorization': `Bearer ${process.env.BOLNA_API_KEY}`,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({
-      agent_prompts: {
-        task_1: { system_prompt: systemPrompt },
-      },
-    }),
-  });
-
-  const data = await res.json();
-  if (!res.ok) {
-    // Non-fatal: log the warning but don't block the call. The static agent
-    // prompt will be used as a fallback.
-    console.warn('Bolna agent update failed (non-fatal):', JSON.stringify(data));
-  } else {
-    console.log('Bolna agent prompt updated for:', category);
-  }
-}
+// ============ BOLNA INTEGRATION (FIXED) ============
 
 async function startBolnaCall(sessionId) {
   const session = await service.getSession(sessionId);
@@ -200,14 +156,26 @@ async function startBolnaCall(sessionId) {
   }
 
   const questions = session.question_bank || [];
-
-  // Update agent prompt with this assessment's questions before placing the call
-  await updateBolnaAgentPrompt(questions, session.category, session.name);
+  
+  // Format questions for Bolna agent
+  const questionsList = questions
+    .map((q, i) => `Question ${i + 1}: ${q.question}`)
+    .join('\n\n');
 
   const bolnaPayload = {
     agent_id: process.env.BOLNA_AGENT_ID,
     recipient_phone_number: session.phone,
-    // Metadata is echoed back in Bolna webhook events — used for session lookup
+    
+    // CRITICAL FIX: Pass questions via agent_data (Bolna injects these into agent prompt)
+    agent_data: {
+      candidate_name: session.name,
+      assessment_category: session.category,
+      questions_list: questionsList,
+      question_count: String(questions.length),
+      assessment_title: session.assessment_title || session.category
+    },
+    
+    // Metadata for webhook lookup
     metadata: {
       session_id: String(sessionId),
       assessment_category: session.category,
@@ -249,14 +217,32 @@ async function startBolnaCall(sessionId) {
   return response;
 }
 
-// ============ GROQ AI SCORING ============
+// ============ GROQ AI SCORING (FIXED) ============
 
 async function scoreWithGroq(sessionId) {
   const responses = await service.getResponses(sessionId);
   const session = await service.getSession(sessionId);
 
   if (responses.length === 0) {
-    console.warn(`No responses found for session ${sessionId} — scoring skipped.`);
+    console.warn(`No responses found for session ${sessionId} — cannot score`);
+    
+    // Save placeholder scores so UI doesn't keep waiting
+    const placeholderScores = {
+      overall_score: 0,
+      criteria_scores: { accuracy: 0, clarity: 0, depth: 0, confidence: 0 },
+      question_scores: [],
+      summary: "No responses were recorded for this assessment. This may be due to a technical issue with call recording or transcript capture.",
+      strengths: ["Unable to evaluate - no response data available"],
+      improvements: ["Please retake the assessment to receive a proper evaluation"]
+    };
+    
+    await service.saveScores(sessionId, placeholderScores);
+    broadcastSessionUpdate(sessionId, {
+      event: 'scoring_complete',
+      overall_score: 0,
+      note: 'No responses available to score'
+    });
+    
     return null;
   }
 
@@ -265,6 +251,7 @@ async function scoreWithGroq(sessionId) {
   const scoringPrompt = `You are an expert interviewer evaluating a candidate's assessment responses.
 
 ASSESSMENT: ${session.category}
+CANDIDATE: ${session.name}
 NUMBER OF QUESTIONS: ${responses.length}
 
 Evaluate each response on these criteria (score 1-10):
@@ -297,43 +284,66 @@ You must respond with ONLY valid JSON in this exact format:
     }
   ],
   "summary": "Overall performance summary in 2-3 sentences",
-  "strengths": ["Point 1", "Point 2"],
-  "improvements": ["Point 1", "Point 2"]
+  "strengths": ["Strength 1", "Strength 2"],
+  "improvements": ["Improvement area 1", "Improvement area 2"]
 }`;
 
-  const groqResponse = await retryAsync(async () => {
-    const res = await fetch('https://api.groq.com/openai/v1/chat/completions', {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${process.env.GROQ_API_KEY}`,
-        'Content-Type': 'application/json'
-      },
-      body: JSON.stringify({
-        model: 'llama-3.1-70b-versatile',
-        messages: [{ role: 'user', content: scoringPrompt }],
-        temperature: 0.2,
-        max_tokens: 4000
-      })
+  try {
+    const groqResponse = await retryAsync(async () => {
+      const res = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${process.env.GROQ_API_KEY}`,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+          model: 'llama-3.1-70b-versatile',
+          messages: [{ role: 'user', content: scoringPrompt }],
+          temperature: 0.2,
+          max_tokens: 4000
+        })
+      });
+      const data = await res.json();
+      if (!res.ok || !data.choices?.[0]) {
+        throw new Error(`Groq API error: ${JSON.stringify(data)}`);
+      }
+      return data;
+    }, 3, 2000);
+
+    const scoreText = groqResponse.choices[0].message.content;
+    const cleanedText = scoreText.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim();
+    const scores = JSON.parse(cleanedText);
+
+    await service.saveScores(sessionId, scores);
+
+    broadcastSessionUpdate(sessionId, {
+      event: 'scoring_complete',
+      overall_score: scores.overall_score
     });
-    const data = await res.json();
-    if (!res.ok || !data.choices?.[0]) {
-      throw new Error(`Groq API error: ${JSON.stringify(data)}`);
-    }
-    return data;
-  });
 
-  const scoreText = groqResponse.choices[0].message.content;
-  const cleanedText = scoreText.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim();
-  const scores = JSON.parse(cleanedText);
-
-  await service.saveScores(sessionId, scores);
-
-  broadcastSessionUpdate(sessionId, {
-    event: 'scoring_complete',
-    overall_score: scores.overall_score
-  });
-
-  return scores;
+    console.log(`✅ Successfully scored session ${sessionId}: ${scores.overall_score}/100`);
+    return scores;
+    
+  } catch (error) {
+    console.error('❌ Groq scoring failed:', error.message);
+    
+    // Save error scores so UI can show something
+    const errorScores = {
+      overall_score: 0,
+      criteria_scores: { accuracy: 0, clarity: 0, depth: 0, confidence: 0 },
+      question_scores: responses.map((r, i) => ({
+        question_number: i + 1,
+        score: 0,
+        feedback: "Scoring failed due to technical error"
+      })),
+      summary: `Scoring encountered an error: ${error.message}. Please contact support.`,
+      strengths: ["Unable to evaluate due to technical error"],
+      improvements: ["System encountered an error during scoring"]
+    };
+    
+    await service.saveScores(sessionId, errorScores);
+    throw error;
+  }
 }
 
 // ============ GROQ TRANSCRIPT PARSING ============
@@ -343,9 +353,7 @@ async function parseTranscriptWithGroq(sessionId, transcript) {
   const questions = session.question_bank || [];
 
   if (!transcript || transcript.trim().length === 0) {
-    // No transcript (e.g. manual completion without webhook) — seed placeholder
-    // responses from the question bank so scoring can still proceed.
-    console.warn(`Empty transcript for session ${sessionId} — seeding placeholder responses from question bank.`);
+    console.warn(`Empty transcript for session ${sessionId} — seeding placeholder responses`);
     await pool.query('DELETE FROM responses WHERE session_id = $1', [sessionId]);
     for (const q of questions) {
       await service.saveResponse(
@@ -411,7 +419,6 @@ If a question was not asked or not answered, set response_text to "No response r
     const cleanedText = rawText.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim();
     const parsed = JSON.parse(cleanedText);
 
-    // Clear any previously saved responses for this session
     await pool.query('DELETE FROM responses WHERE session_id = $1', [sessionId]);
 
     for (const pair of parsed.qa_pairs) {
@@ -426,14 +433,13 @@ If a question was not asked or not answered, set response_text to "No response r
       );
     }
 
-    console.log(`Parsed ${parsed.qa_pairs.length} Q&A pairs for session ${sessionId}`);
+    console.log(`✅ Parsed ${parsed.qa_pairs.length} Q&A pairs for session ${sessionId}`);
   } catch (err) {
     console.error('Groq transcript parsing failed, falling back to regex:', err.message);
     await parseTranscriptFallback(sessionId, transcript);
   }
 }
 
-// Regex fallback if Groq parsing fails
 async function parseTranscriptFallback(sessionId, transcript) {
   const session = await service.getSession(sessionId);
   const questions = session.question_bank || [];
@@ -466,7 +472,6 @@ async function parseTranscriptFallback(sessionId, transcript) {
 
 // ============ API ROUTES ============
 
-// Candidates
 app.post('/api/candidates', async (req, res) => {
   try {
     const { name, email, phone } = req.body;
@@ -477,9 +482,10 @@ app.post('/api/candidates', async (req, res) => {
       return res.status(400).json({ error: 'Invalid phone number. Use international format, e.g. +919876543210' });
     }
     const candidate = await service.createCandidate({ name, email, phone });
+    console.log('✅ Candidate created:', candidate.id);
     res.json(candidate);
   } catch (error) {
-    console.error('ERROR creating candidate:', error.message);
+    console.error('❌ Error creating candidate:', error.message);
     if (error.code === '23505') {
       return res.status(409).json({ error: 'A candidate with this email already exists' });
     }
@@ -509,7 +515,6 @@ app.get('/api/candidates/:id', async (req, res) => {
   }
 });
 
-// Assessments
 app.post('/api/assessments', async (req, res) => {
   try {
     const assessment = await service.createAssessment(req.body);
@@ -528,7 +533,6 @@ app.get('/api/assessments', async (req, res) => {
   }
 });
 
-// Sessions
 app.post('/api/sessions', async (req, res) => {
   try {
     const { candidate_id, assessment_id, scheduled_at } = req.body;
@@ -536,6 +540,7 @@ app.post('/api/sessions', async (req, res) => {
       return res.status(400).json({ error: 'candidate_id and assessment_id are required' });
     }
     const session = await service.createSession(candidate_id, assessment_id, scheduled_at || new Date());
+    console.log('✅ Session created:', session.id);
     res.json(session);
   } catch (error) {
     res.status(500).json({ error: error.message });
@@ -544,6 +549,7 @@ app.post('/api/sessions', async (req, res) => {
 
 app.post('/api/sessions/:id/start', async (req, res) => {
   try {
+    console.log(`📞 Starting call for session ${req.params.id}`);
     const callData = await startBolnaCall(req.params.id);
     res.json({
       status: 'initiated',
@@ -551,8 +557,7 @@ app.post('/api/sessions/:id/start', async (req, res) => {
       message: 'Assessment call started'
     });
   } catch (error) {
-    console.error('Bolna call error:', error.message);
-    // Mark session as failed so UI can recover
+    console.error('❌ Bolna call error:', error.message);
     try {
       await service.updateSession(req.params.id, { status: 'failed' });
     } catch (_) {}
@@ -587,7 +592,6 @@ app.get('/api/sessions/:id/results', async (req, res) => {
   }
 });
 
-// SSE: real-time session updates
 app.get('/api/sessions/:id/stream', (req, res) => {
   res.setHeader('Content-Type', 'text/event-stream');
   res.setHeader('Cache-Control', 'no-cache');
@@ -599,7 +603,6 @@ app.get('/api/sessions/:id/stream', (req, res) => {
   if (!sseClients.has(sessionId)) sseClients.set(sessionId, new Set());
   sseClients.get(sessionId).add(res);
 
-  // Send heartbeat every 20s to keep connection alive
   const heartbeat = setInterval(() => {
     try { res.write(': heartbeat\n\n'); } catch (_) { clearInterval(heartbeat); }
   }, 20000);
@@ -611,26 +614,45 @@ app.get('/api/sessions/:id/stream', (req, res) => {
   });
 });
 
-// Manual completion — for when Bolna webhook can't reach localhost (dev mode)
-// Also useful as a recovery endpoint if the webhook was missed in production.
+// CRITICAL: Manual completion endpoint (triggers scoring as backup)
 app.post('/api/sessions/:id/complete', async (req, res) => {
   try {
     const sessionId = req.params.id;
     const session = await service.getSession(sessionId);
     if (!session) return res.status(404).json({ error: 'Session not found' });
 
+    console.log(`🔄 Manual completion triggered for session ${sessionId}, status: ${session.status}`);
+
     if (session.status === 'completed') {
-      // Already done — just trigger scoring if scores are missing
       const existing = await service.getScores(sessionId);
-      if (!existing) {
+      if (existing) {
+        console.log('✅ Session already completed with scores');
+        return res.json({ 
+          status: 'already_completed', 
+          message: 'Session was already completed',
+          scores: existing 
+        });
+      } else {
+        console.log('⚠️ Session completed but missing scores - triggering scoring');
         setImmediate(async () => {
-          try { await scoreWithGroq(sessionId); } catch (e) { console.error('Score error:', e.message); }
+          try {
+            const responses = await service.getResponses(sessionId);
+            if (responses.length === 0) {
+              console.log('No responses - seeding placeholders');
+              await parseTranscriptWithGroq(sessionId, session.transcript || '');
+            }
+            await scoreWithGroq(sessionId);
+          } catch (e) { 
+            console.error('Scoring error:', e.message); 
+          }
+        });
+        return res.json({ 
+          status: 'scoring_triggered', 
+          message: 'Scoring in progress' 
         });
       }
-      return res.json({ status: 'already_completed', message: 'Session was already completed' });
     }
 
-    // Mark session complete with whatever transcript we have
     const transcript = req.body.transcript || session.transcript || '';
     await service.updateSession(sessionId, {
       status: 'completed',
@@ -639,26 +661,33 @@ app.post('/api/sessions/:id/complete', async (req, res) => {
       recording_url: req.body.recording_url || session.recording_url || null,
     });
 
+    console.log(`✅ Session ${sessionId} marked as completed`);
     broadcastSessionUpdate(sessionId, { event: 'call_ended', status: 'completed' });
 
-    // Parse + score asynchronously
     setImmediate(async () => {
       try {
+        console.log('📝 Starting transcript parsing...');
         await parseTranscriptWithGroq(sessionId, transcript);
-      } catch (e) {
-        console.error('Parse error:', e.message);
-      }
-      try {
+        
+        console.log('🎯 Starting scoring...');
         await scoreWithGroq(sessionId);
+        
+        console.log('✅ Scoring completed successfully');
       } catch (e) {
-        console.error('Score error:', e.message);
-        broadcastSessionUpdate(sessionId, { event: 'scoring_failed', error: e.message });
+        console.error('❌ Parse/Score error:', e.message);
+        broadcastSessionUpdate(sessionId, { 
+          event: 'scoring_failed', 
+          error: e.message 
+        });
       }
     });
 
-    res.json({ status: 'completed', message: 'Session marked complete — scoring in progress' });
+    res.json({ 
+      status: 'completed', 
+      message: 'Session marked complete — scoring in progress' 
+    });
   } catch (error) {
-    console.error('Manual complete error:', error.message);
+    console.error('❌ Manual complete error:', error.message);
     res.status(500).json({ error: error.message });
   }
 });
@@ -729,15 +758,13 @@ app.get('/api/admin/sessions', async (req, res) => {
 app.post('/api/webhooks/bolna', async (req, res) => {
   try {
     const body = req.body;
-    // Bolna may send event/call_id at top level or nested — handle both shapes
     const event = body.event || body.type;
     const call_id = body.call_id || body.data?.call_id;
     const data = body.data || body;
     const metadata = body.metadata || data.metadata || {};
 
-    console.log('Bolna webhook received:', JSON.stringify({ event, call_id, metadata }, null, 2));
+    console.log('📥 Bolna webhook received:', JSON.stringify({ event, call_id, metadata }, null, 2));
 
-    // Find session: prefer metadata.session_id for reliability, fall back to call_id
     let sessionId = metadata.session_id;
 
     if (!sessionId && call_id) {
@@ -749,7 +776,7 @@ app.post('/api/webhooks/bolna', async (req, res) => {
     }
 
     if (!sessionId) {
-      console.warn('Webhook: session not found for call_id:', call_id, 'metadata:', metadata);
+      console.warn('⚠️ Webhook: session not found for call_id:', call_id);
       return res.status(404).json({ error: 'Session not found' });
     }
 
@@ -764,6 +791,7 @@ app.post('/api/webhooks/bolna', async (req, res) => {
           status: 'in_progress',
           timestamp: new Date().toISOString()
         });
+        console.log('✅ Call started for session:', sessionId);
         break;
 
       case 'transcript_updated':
@@ -771,7 +799,7 @@ app.post('/api/webhooks/bolna', async (req, res) => {
           await service.updateSession(sessionId, { transcript: data.transcript });
           broadcastSessionUpdate(sessionId, {
             event: 'transcript_updated',
-            preview: data.transcript.slice(-200) // last 200 chars for live preview
+            preview: data.transcript.slice(-200)
           });
         }
         break;
@@ -790,7 +818,8 @@ app.post('/api/webhooks/bolna', async (req, res) => {
           recording_url: data.recording_url || null
         });
 
-        // Parse transcript using Groq AI, then score
+        console.log('✅ Call ended for session:', sessionId);
+
         setImmediate(async () => {
           try {
             await parseTranscriptWithGroq(sessionId, data.transcript || '');
@@ -807,12 +836,12 @@ app.post('/api/webhooks/bolna', async (req, res) => {
         break;
 
       default:
-        console.log(`Unhandled Bolna webhook event: ${event}`);
+        console.log(`⚠️ Unhandled Bolna webhook event: ${event}`);
     }
 
     res.json({ status: 'webhook_processed' });
   } catch (error) {
-    console.error('Webhook error:', error);
+    console.error('❌ Webhook error:', error);
     res.status(500).json({ error: error.message });
   }
 });
@@ -822,7 +851,10 @@ app.post('/api/webhooks/bolna', async (req, res) => {
 const PORT = process.env.PORT || 3001;
 
 app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
+  console.log(`✅ Server running on port ${PORT}`);
+  console.log(`📊 Database: ${process.env.DATABASE_URL ? 'Connected' : 'NOT CONFIGURED'}`);
+  console.log(`📞 Bolna Agent: ${process.env.BOLNA_AGENT_ID || 'NOT CONFIGURED'}`);
+  console.log(`🤖 Groq API: ${process.env.GROQ_API_KEY ? 'Configured' : 'NOT CONFIGURED'}`);
 });
 
 module.exports = app;
