@@ -146,7 +146,7 @@ async function retryAsync(fn, retries = 3, delayMs = 1000) {
   }
 }
 
-// ============ BOLNA INTEGRATION (FIXED) ============
+// ============ BOLNA INTEGRATION ============
 
 async function startBolnaCall(sessionId) {
   const session = await service.getSession(sessionId);
@@ -156,30 +156,29 @@ async function startBolnaCall(sessionId) {
   }
 
   const questions = session.question_bank || [];
-  
-  // Format questions for Bolna agent
+  const questionCount = String(questions.length);
   const questionsList = questions
     .map((q, i) => `Question ${i + 1}: ${q.question}`)
     .join('\n\n');
 
+  // Bolna's call API populates {{variable}} placeholders in the agent prompt
+  // via the top-level "variables" field. The agent on the Bolna platform must
+  // already have these variable names in its system prompt template.
+  // agent_data only accepts voice_id — do NOT put variables there.
   const bolnaPayload = {
     agent_id: process.env.BOLNA_AGENT_ID,
     recipient_phone_number: session.phone,
-    
-    // CRITICAL FIX: Pass questions via agent_data (Bolna injects these into agent prompt)
-    agent_data: {
+    variables: {
       candidate_name: session.name,
       assessment_category: session.category,
+      assessment_type: session.category,
       questions_list: questionsList,
-      question_count: String(questions.length),
-      assessment_title: session.assessment_title || session.category
+      question_count: questionCount,
+      assessment_title: session.assessment_title || session.category,
     },
-    
-    // Metadata for webhook lookup
+    // metadata is echoed back in webhook events — used for reliable session lookup
     metadata: {
       session_id: String(sessionId),
-      assessment_category: session.category,
-      candidate_name: session.name,
     },
   };
 
