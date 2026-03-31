@@ -570,6 +570,58 @@ app.get('/api/sessions/:id/stream', (req, res) => {
   });
 });
 
+// Manual completion — for when Bolna webhook can't reach localhost (dev mode)
+// Also useful as a recovery endpoint if the webhook was missed in production.
+app.post('/api/sessions/:id/complete', async (req, res) => {
+  try {
+    const sessionId = req.params.id;
+    const session = await service.getSession(sessionId);
+    if (!session) return res.status(404).json({ error: 'Session not found' });
+
+    if (session.status === 'completed') {
+      // Already done — just trigger scoring if scores are missing
+      const existing = await service.getScores(sessionId);
+      if (!existing) {
+        setImmediate(async () => {
+          try { await scoreWithGroq(sessionId); } catch (e) { console.error('Score error:', e.message); }
+        });
+      }
+      return res.json({ status: 'already_completed', message: 'Session was already completed' });
+    }
+
+    // Mark session complete with whatever transcript we have
+    const transcript = req.body.transcript || session.transcript || '';
+    await service.updateSession(sessionId, {
+      status: 'completed',
+      completed_at: new Date(),
+      transcript: transcript || null,
+      recording_url: req.body.recording_url || session.recording_url || null,
+    });
+
+    broadcastSessionUpdate(sessionId, { event: 'call_ended', status: 'completed' });
+
+    // Parse + score asynchronously
+    setImmediate(async () => {
+      try {
+        await parseTranscriptWithGroq(sessionId, transcript);
+      } catch (e) {
+        console.error('Parse error:', e.message);
+      }
+      try {
+        await scoreWithGroq(sessionId);
+      } catch (e) {
+        console.error('Score error:', e.message);
+        broadcastSessionUpdate(sessionId, { event: 'scoring_failed', error: e.message });
+      }
+    });
+
+    res.json({ status: 'completed', message: 'Session marked complete — scoring in progress' });
+  } catch (error) {
+    console.error('Manual complete error:', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // ============ ADMIN ROUTES ============
 
 app.get('/api/admin/stats', async (req, res) => {

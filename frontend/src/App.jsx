@@ -309,9 +309,12 @@ function AssessmentPage() {
   const [loading, setLoading] = useState(true);
   const [callDuration, setCallDuration] = useState(0);
   const [transcriptPreview, setTranscriptPreview] = useState('');
+  const [showManualEnd, setShowManualEnd] = useState(false);
+  const [manualLoading, setManualLoading] = useState(false);
   const timerRef = useRef(null);
   const sseRef = useRef(null);
   const pollRef = useRef(null);
+  const manualBtnTimerRef = useRef(null);
 
   useEffect(() => {
     fetch(`${API_BASE}/api/sessions/${id}/status`)
@@ -364,6 +367,8 @@ function AssessmentPage() {
   function startTimer() {
     if (timerRef.current) return;
     timerRef.current = setInterval(() => setCallDuration(s => s + 1), 1000);
+    // Show manual-end button after 30s in case webhook never arrives
+    manualBtnTimerRef.current = setTimeout(() => setShowManualEnd(true), 30000);
   }
 
   function startPolling() {
@@ -383,11 +388,31 @@ function AssessmentPage() {
   function cleanup() {
     clearInterval(timerRef.current);
     clearInterval(pollRef.current);
+    clearTimeout(manualBtnTimerRef.current);
     sseRef.current?.close();
     timerRef.current = null;
     pollRef.current = null;
     sseRef.current = null;
+    manualBtnTimerRef.current = null;
   }
+
+  const handleManualEnd = async () => {
+    setManualLoading(true);
+    try {
+      const res = await fetch(`${API_BASE}/api/sessions/${id}/complete`, { method: 'POST' });
+      if (!res.ok) {
+        const err = await res.json();
+        throw new Error(err.error || 'Failed to process results');
+      }
+      cleanup();
+      // Give scoring a moment to kick off, then go to results
+      addToast('Processing your results...', 'info');
+      setTimeout(() => navigate(`/results/${id}`), 2500);
+    } catch (error) {
+      addToast(error.message, 'error');
+      setManualLoading(false);
+    }
+  };
 
   const startCall = async () => {
     setStatus('starting');
@@ -482,6 +507,19 @@ function AssessmentPage() {
             <div className="bg-yellow-50 border border-yellow-200 rounded-lg p-4 text-sm text-yellow-800">
               Do not close this window. You'll be automatically redirected when the call ends.
             </div>
+
+            {showManualEnd && (
+              <div className="mt-6 pt-6 border-t border-gray-200">
+                <p className="text-sm text-gray-500 mb-3">Call already finished but page didn't redirect?</p>
+                <button
+                  onClick={handleManualEnd}
+                  disabled={manualLoading}
+                  className="w-full bg-green-600 text-white py-3 rounded-lg font-semibold hover:bg-green-700 transition-colors disabled:opacity-60"
+                >
+                  {manualLoading ? 'Processing results...' : 'My call has ended — view results'}
+                </button>
+              </div>
+            )}
           </div>
         )}
 
